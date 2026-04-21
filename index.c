@@ -1,6 +1,5 @@
 // index.c — Staging area implementation
 #include "index.h"
-#include "object.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +7,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
+
+// Forward declaration
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
@@ -108,7 +110,7 @@ int index_load(Index *index) {
     index->count = 0;
 
     FILE *f = fopen(INDEX_FILE, "r");
-    if (!f) return 0; // No index file yet — empty index, not an error
+    if (!f) return 0;
 
     char hex[HASH_HEX_SIZE + 1];
     uint32_t mode;
@@ -132,40 +134,41 @@ int index_load(Index *index) {
 }
 
 int index_save(const Index *index) {
-    // Sort entries by path
-    Index sorted = *index;
-    qsort(sorted.entries, sorted.count, sizeof(IndexEntry), compare_index_entries);
+    // Use heap allocation to avoid stack overflow with large Index struct
+    Index *sorted = malloc(sizeof(Index));
+    if (!sorted) return -1;
+    *sorted = *index;
 
-    // Write to temp file
+    qsort(sorted->entries, sorted->count, sizeof(IndexEntry), compare_index_entries);
+
     char tmp_path[] = ".pes/index_tmp_XXXXXX";
     int fd = mkstemp(tmp_path);
-    if (fd < 0) return -1;
+    if (fd < 0) { free(sorted); return -1; }
 
     FILE *f = fdopen(fd, "w");
-    if (!f) { close(fd); return -1; }
+    if (!f) { close(fd); free(sorted); return -1; }
 
     char hex[HASH_HEX_SIZE + 1];
-    for (int i = 0; i < sorted.count; i++) {
-        hash_to_hex(&sorted.entries[i].hash, hex);
+    for (int i = 0; i < sorted->count; i++) {
+        hash_to_hex(&sorted->entries[i].hash, hex);
         fprintf(f, "%o %s %llu %u %s\n",
-                sorted.entries[i].mode,
+                sorted->entries[i].mode,
                 hex,
-                (unsigned long long)sorted.entries[i].mtime_sec,
-                sorted.entries[i].size,
-                sorted.entries[i].path);
+                (unsigned long long)sorted->entries[i].mtime_sec,
+                sorted->entries[i].size,
+                sorted->entries[i].path);
     }
 
     fflush(f);
     fsync(fileno(f));
     fclose(f);
+    free(sorted);
 
-    // Atomic rename
     rename(tmp_path, INDEX_FILE);
     return 0;
 }
 
 int index_add(Index *index, const char *path) {
-    // Read the file
     FILE *f = fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "error: cannot open '%s'\n", path);
@@ -176,12 +179,12 @@ int index_add(Index *index, const char *path) {
     size_t file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    void *data = malloc(file_size);
+    void *data = malloc(file_size + 1);
     if (!data) { fclose(f); return -1; }
-    fread(data, 1, file_size, f);
+    size_t nr = fread(data, 1, file_size, f);
     fclose(f);
+    if (nr != file_size) { free(data); return -1; }
 
-    // Write blob to object store
     ObjectID id;
     if (object_write(OBJ_BLOB, data, file_size, &id) != 0) {
         free(data);
@@ -189,13 +192,12 @@ int index_add(Index *index, const char *path) {
     }
     free(data);
 
-    // Get file metadata
     struct stat st;
     if (stat(path, &st) != 0) return -1;
 
-    // Update or add index entry
     IndexEntry *existing = index_find(index, path);
     if (!existing) {
+        if (index->count >= MAX_INDEX_ENTRIES) return -1;
         existing = &index->entries[index->count++];
     }
 
